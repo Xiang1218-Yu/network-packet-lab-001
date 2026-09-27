@@ -46,3 +46,41 @@ export interface ParseRequest {
   scenario: PacketScenario;
   raw: string;
 }
+
+/** 加入捕获会话时提交的内容：原始输入 + 协议/场景，解析结果由服务端生成 */
+export interface CaptureFrameInput {
+  protocol: Protocol;
+  scenario: PacketScenario;
+  raw: string;
+  note?: string;
+}
+
+/** 不可变帧：解析快照一旦生成不再变化，只有备注可单独修改 */
+export interface CaptureFrame {
+  id: string;
+  protocol: Protocol;
+  scenario: PacketScenario;
+  note: string;
+  addedAt: string;
+  packet: SimulatedPacket;
+}
+
+export interface CaptureSession {
+  id: string;
+  title: string;
+  createdAt: string;
+  updatedAt: string;
+  frames: CaptureFrame[];
+}
+
+export interface CreateSessionRequest {
+  title?: string;
+  /** 创建会话的同时追加第一帧，避免前端连发两次请求 */
+  frame?: CaptureFrameInput;
+}
+
+export type AppendFrameRequest = CaptureFrameInput;
+
+export interface UpdateNoteRequest {
+  note: string;
+}

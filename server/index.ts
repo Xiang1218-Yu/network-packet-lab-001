@@ -1,12 +1,19 @@
 import express, { type Request, type Response } from 'express';
+import { randomUUID } from 'node:crypto';
 import type {
+  AppendFrameRequest,
+  CaptureFrame,
+  CaptureFrameInput,
+  CaptureSession,
+  CreateSessionRequest,
   HexRow,
   PacketScenario,
   ParseRequest,
   Protocol,
   ProtocolField,
   SimulatedPacket,
-  TimelineEvent
+  TimelineEvent,
+  UpdateNoteRequest
 } from '../shared/types.js';
 
 const app = express();
@@ -16,7 +23,7 @@ app.use(express.json({ limit: '1mb' }));
 app.use((request, response, next) => {
   response.header('Access-Control-Allow-Origin', '*');
   response.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-  response.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  response.header('Access-Control-Allow-Methods', 'GET,POST,PATCH,DELETE,OPTIONS');
   if (request.method === 'OPTIONS') return response.sendStatus(204);
   next();
 });
@@ -160,6 +167,44 @@ function buildPacket(protocol: Protocol, scenario: PacketScenario, raw: string):
 function isProtocol(value: unknown): value is Protocol { return value === 'HTTP' || value === 'TCP'; }
 function isScenario(value: unknown): value is PacketScenario { return value === 'request' || value === 'response' || value === 'handshake'; }
 
+function readFrameInput(body: unknown): { input?: CaptureFrameInput; error?: string } {
+  const source = (body as Partial<CaptureFrameInput> | null | undefined) ?? {};
+  if (!isProtocol(source.protocol)) return { error: 'protocol must be HTTP or TCP' };
+  if (!isScenario(source.scenario)) return { error: 'scenario must be request, response or handshake' };
+  if (typeof source.raw !== 'string') return { error: 'raw is required' };
+  if (!source.raw.trim()) return { error: 'raw is required' };
+  const note = source.note ?? '';
+  if (typeof note !== 'string') return { error: 'note must be a string' };
+  return { input: { protocol: source.protocol, scenario: source.scenario, raw: source.raw, note: note.trim() } };
+}
+
+function makeFrame(input: CaptureFrameInput): CaptureFrame {
+  return {
+    id: randomUUID(),
+    protocol: input.protocol,
+    scenario: input.scenario,
+    note: input.note ?? '',
+    addedAt: new Date().toISOString(),
+    packet: buildPacket(input.protocol, input.scenario, input.raw)
+  };
+}
+
+function touch(session: CaptureSession): void {
+  session.updatedAt = new Date().toISOString();
+}
+
+// ---------------------------------------------------------------------------
+// 捕获会话存储（进程内存；教学演示用，重启即清空）
+// ---------------------------------------------------------------------------
+
+const sessions = new Map<string, CaptureSession>();
+
+function getSessionOr404(sessionId: string, response: Response): CaptureSession | null {
+  const session = sessions.get(sessionId);
+  if (!session) response.status(404).json({ error: 'session not found' });
+  return session ?? null;
+}
+
 app.get('/api/health', (_request, response) => response.json({ ok: true, service: 'network-packet-lab-api' }));
 
 app.get('/api/simulate', (request, response) => {
@@ -180,6 +225,80 @@ app.post('/api/parse', (request: Request<unknown, unknown, Partial<ParseRequest>
   const raw = typeof request.body?.raw === 'string' ? request.body.raw : '';
   if (!raw.trim()) return response.status(400).json({ error: 'raw is required' });
   response.json({ data: buildPacket(protocol, scenario, raw) });
+});
+
+// 创建会话，可选地同时追加第一帧
+app.post('/api/sessions', (request: Request<unknown, unknown, Partial<CreateSessionRequest>>, response: Response) => {
+  const title = typeof request.body?.title === 'string' && request.body.title.trim()
+    ? request.body.title.trim().slice(0, 120)
+    : `捕获会话 · ${new Date().toLocaleString('zh-CN', { hour12: false })}`;
+
+  let firstFrame: CaptureFrame | undefined;
+  if (request.body?.frame !== undefined) {
+    const { input, error } = readFrameInput(request.body.frame);
+    if (error) return response.status(400).json({ error });
+    firstFrame = makeFrame(input!);
+  }
+
+  const now = new Date().toISOString();
+  const session: CaptureSession = {
+    id: randomUUID(),
+    title,
+    createdAt: now,
+    updatedAt: now,
+    frames: firstFrame ? [firstFrame] : []
+  };
+  sessions.set(session.id, session);
+  response.status(201).json({ data: session });
+});
+
+// 会话列表（按最近更新排序，供前端恢复“最近一次会话”兜底使用）
+app.get('/api/sessions', (_request, response) => {
+  const data = [...sessions.values()].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  response.json({ data });
+});
+
+app.get('/api/sessions/:id', (request, response) => {
+  const session = getSessionOr404(request.params.id, response);
+  if (session) response.json({ data: session });
+});
+
+// 追加不可变帧
+app.post('/api/sessions/:id/frames', (request: Request<{ id: string }, unknown, Partial<AppendFrameRequest>>, response: Response) => {
+  const session = getSessionOr404(request.params.id, response);
+  if (!session) return;
+  const { input, error } = readFrameInput(request.body);
+  if (error) return response.status(400).json({ error });
+  session.frames.push(makeFrame(input!));
+  touch(session);
+  response.status(201).json({ data: session });
+});
+
+// 修改帧备注（帧快照本身不可变）
+app.patch('/api/sessions/:id/frames/:frameId', (request: Request<{ id: string; frameId: string }, unknown, Partial<UpdateNoteRequest>>, response: Response) => {
+  const session = getSessionOr404(request.params.id, response);
+  if (!session) return;
+  const frame = session.frames.find((item) => item.id === request.params.frameId);
+  if (!frame) return response.status(404).json({ error: 'frame not found' });
+  if (typeof request.body?.note !== 'string') return response.status(400).json({ error: 'note is required' });
+  frame.note = request.body.note.slice(0, 500);
+  touch(session);
+  response.json({ data: session });
+});
+
+app.delete('/api/sessions/:id/frames/:frameId', (request, response) => {
+  const session = getSessionOr404(request.params.id, response);
+  if (!session) return;
+  const index = session.frames.findIndex((item) => item.id === request.params.frameId);
+  if (index === -1) return response.status(404).json({ error: 'frame not found' });
+  session.frames.splice(index, 1);
+  touch(session);
+  response.json({ data: session });
+});
+
+app.delete('/api/sessions/:id', (request, response) => {
+  if (!sessions.delete(request.params.id)) return response.status(404).json({ error: 'session not found' });
+  response.status(204).send();
 });
 
 app.listen(port, () => {
